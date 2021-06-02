@@ -19,89 +19,103 @@ interface IERC20Extended {
     function symbol() external view returns (string memory);
 }
 
-contract ProviderStrategy is BaseStrategy {
+interface AMMPool is IERC20 {
+    function token0() external view returns (address);
+
+    function token1() external view returns (address);
+
+    function getReserves() external view returns (uint256 reserveA, uint256 reserveB);
+
+    function mint(address to) external returns (uint256 liquidity);
+
+    function burn(address to) external returns (uint256 amount0, uint256 amount1);
+}
+
+contract AMMStrategy is BaseStrategy {
     using SafeERC20 for IERC20;
     using Address for address;
     using SafeMath for uint256;
 
-    address public joint;
-    bool public takeProfit;
-    bool public investWant;
+    IERC20 public other;
+    AMMPool public pool;
+    AMMStrategy public partner;
 
-    constructor(address _vault, address _joint) public BaseStrategy(_vault) {
-        _initializeStrat(_joint);
+    bool public wantIsToken0;
+
+    constructor(address _vault, address _pool, address _partner) public BaseStrategy(_vault) {
+        pool = AMMPool(_pool);
+        partner = AMMStrategy(_partner);
+
+        // Check to make sure we don't end up in a bad position with our partner
+        address _want = address(want);
+        address _other = partner.want();
+        require(_want != _other);
+        other = IERC20(_other);
+
+        address token0 = pool.token0();
+        address token1 = pool.token1();
+        require(_want == token0 || _want == token1);
+        require(_other == token0 || _other == token1);
+
+        if (_want == token0) {
+            wantIsToken0 = true;
+        } // else `wantIsToken0 = false` from empty value
+
+        // We trust our partners! (for `provideAndSplit` and `negotiateLiquidation`)
+        other.safeApprove(address(partner), uint256(-1));
+        pool.safeApprove(address(partner), uint256(-1));
     }
 
-    function initialize(
-        address _vault,
-        address _strategist,
-        address _rewards,
-        address _keeper,
-        address _joint
-    ) external {
-        _initialize(_vault, _strategist, _rewards, _keeper);
-        _initializeStrat(_joint);
-    }
-
-    function _initializeStrat(address _joint) internal {
-        require(
-            address(joint) == address(0),
-            "ProviderStrategy already initialized"
-        );
-        joint = _joint;
-        investWant = true;
-        takeProfit = false;
-    }
-
-    event Cloned(address indexed clone);
-
-    function cloneProviderStrategy(
-        address _vault,
-        address _strategist,
-        address _rewards,
-        address _keeper,
-        address _joint
-    ) external returns (address newStrategy) {
-        bytes20 addressBytes = bytes20(address(this));
-
-        assembly {
-            // EIP-1167 bytecode
-            let clone_code := mload(0x40)
-            mstore(
-                clone_code,
-                0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000000000000000000000
-            )
-            mstore(add(clone_code, 0x14), addressBytes)
-            mstore(
-                add(clone_code, 0x28),
-                0x5af43d82803e903d91602b57fd5bf30000000000000000000000000000000000
-            )
-            newStrategy := create(0, clone_code, 0x37)
-        }
-
-        ProviderStrategy(newStrategy).initialize(
-            _vault,
-            _strategist,
-            _rewards,
-            _keeper,
-            _joint
-        );
-
-        emit Cloned(newStrategy);
+    modifier onlyPartner() {
+        require(msg.sender == address(partner));
+        _;
     }
 
     function name() external view override returns (string memory) {
         return
             string(
                 abi.encodePacked(
-                    "ProviderOf",
+                    "AMMStrategy",
                     IERC20Extended(address(want)).symbol()
+                    IERC20Extended(partner.want()).symbol()
                 )
             );
     }
 
-    function estimatedTotalAssets() public view override returns (uint256) {
+    function setPartner(address _partner) external onlyAuthorized {
+        partner = AMMStrategy(_partner);
+    }
+
+    function balanceOfWant() public view returns (uint256) {
         return want.balanceOf(address(this));
+    }
+
+    function estimatedLPTokenValueInWant() public view returns (uint256) {
+        uint256 strategyTokens = pool.balanceOf(address(this));
+        uint256 totalTokens = pool.totalSupply();
+        (uint reserve0, uint reserve1,) = pool.getReserves();
+        // `x * y = k` invariant implies the value of `EV[y]` in `X` tokens is equivalent to `EV[x]`
+        // NOTE: This doesn't account for temporary slippage, should use an oracle for more important operations
+        if (wantIsToken0) {
+            return strategyTokens.mul(reserve0.mul(2)).div(totalTokens);
+        } else {
+            return strategyTokens.mul(reserve1.mul(2)).div(totalTokens);
+        }
+    }
+
+    function estimatedTotalAssets() public view override returns (uint256) {
+        return want.balanceOf(address(this)).add(estimatedLPTokenValueInWant());
+    }
+
+    function rebalanceLiquidity()
+        external
+        onlyPartner
+        returns (uint256 _benefitLiquidity)
+    {
+        // Assume partner and this contract each had half of the liquidity
+        // Figure out Impermanent Loss benefit towards `want` (if any)
+        // swap half of the IL benefit for `other`
+        // send all `other` back
     }
 
     function prepareReturn(uint256 _debtOutstanding)
@@ -113,22 +127,14 @@ contract ProviderStrategy is BaseStrategy {
             uint256 _debtPayment
         )
     {
-        // if we are not taking profit, there is nothing to do
-        if (!takeProfit) {
-            return (0, 0, 0);
-        }
-
-        // If we reach this point, it means that we are winding down
-        // and we will take profit / losses or pay back debt
-
-        uint256 debt = vault.strategies(address(this)).totalDebt;
+        partner.rebalanceLiquidity();
         uint256 wantBalance = balanceOfWant();
 
         // Set profit or loss based on the initial debt
-        if (debt <= wantBalance) {
+        if (_debtOutstanding <= wantBalance) {
             _profit = wantBalance - debt;
         } else {
-            _loss = debt - wantBalance;
+            _loss = _debtOutstanding - wantBalance;
         }
 
         // Repay debt. Amount will depend if we had profit or loss
@@ -147,19 +153,21 @@ contract ProviderStrategy is BaseStrategy {
         }
     }
 
+    function provideAndSplit(uint256 maxOther) onlyPartner external returns (uint256 halfLiquidity) {
+        // Pull up to `maxOther` amount of `other` into this contract (based on amount of `want`)
+        // Provide equal amount of `want` for `other` and add liquidity to AMM
+        // Divide the new LP tokens into two
+        // Send half the LP tokens back to `partner`, as well as any remaining `other`
+    }
+
     function adjustPosition(uint256 _debtOutstanding) internal override {
         if (emergencyExit) {
             return;
         }
 
-        // If we shouldn't invest, don't do it :D
-        if (!investWant) {
-            return;
-        }
-
         uint256 wantBalance = balanceOfWant();
-        if (wantBalance > 0) {
-            want.transfer(joint, wantBalance);
+        if (wantBalance > _debtOutstanding) {
+            partner.provideAndSplit(wantBalance.sub(_debtOutstanding));
         }
     }
 
@@ -168,18 +176,31 @@ contract ProviderStrategy is BaseStrategy {
         override
         returns (uint256 _liquidatedAmount, uint256 _loss)
     {
-        uint256 totalAssets = want.balanceOf(address(this));
-        if (_amountNeeded > totalAssets) {
+        partner.rebalanceLiquidity();
+        uint256 totalWant = want.balanceOf(address(this));
+
+        // NOTE: Do this after rebalancing liquidity to make sure we're synchronized here
+        if (_amountNeeded > totalWant) {
+            pool.withdraw(_amountNeeded.sub(totalWant));
+            totalWant = want.balanceOf(address(this));
+        }
+
+        if (_amountNeeded > totalWant) {
             _liquidatedAmount = totalAssets;
-            _loss = _amountNeeded.sub(totalAssets);
+            _loss = _amountNeeded.sub(totalWant);
         } else {
             _liquidatedAmount = _amountNeeded;
         }
     }
 
+    function migratePartner(address _partner) onlyPartner external {
+        partner = AMMStrategy(_partner);
+    }
+
     function prepareMigration(address _newStrategy) internal override {
-        // Want is sent to the new strategy in the base class
-        // nothing to do here
+        other.transfer(_newStrategy, other.balanceOf(address(this));
+        pool.transfer(_newStrategy, pool.balanceOf(address(this));
+        partner.migratePartner(_newStrategy);
     }
 
     function protectedTokens()
@@ -187,21 +208,7 @@ contract ProviderStrategy is BaseStrategy {
         view
         override
         returns (address[] memory)
-    {}
-
-    function balanceOfWant() public view returns (uint256) {
-        return IERC20(want).balanceOf(address(this));
-    }
-
-    function setJoint(address _joint) external onlyAuthorized {
-        joint = _joint;
-    }
-
-    function setTakeProfit(bool _takeProfit) external onlyAuthorized {
-        takeProfit = _takeProfit;
-    }
-
-    function setInvestWant(bool _investWant) external onlyAuthorized {
-        investWant = _investWant;
+    {
+        address[] tokens = [address(other), address(pool)];
     }
 }
